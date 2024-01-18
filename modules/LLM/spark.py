@@ -19,6 +19,7 @@ from langchain.callbacks.manager import CallbackManagerForLLMRun
 
 from collections import deque
 from threading import Thread, Condition
+
 class CallbackToIterator:
     def __init__(self):
         self.queue = deque()

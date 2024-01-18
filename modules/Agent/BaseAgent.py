@@ -1,7 +1,8 @@
 from langchain.llms.base import LLM
 from langchain.tools import BaseTool
 from typing import List, Sequence
-from langchain.agents import initialize_agent
+
+from langchain.agents.agent import AgentExecutor
 
 class BaseAgent:
     def __init__(
@@ -27,7 +28,8 @@ if __name__ == "__main__":
     from ..LLM.spark import sparkLLM
     from ..ToolKit import EnterpriseSearch
 
-    agent = initialize_agent(
+    # deprecated
+    '''agent = initialize_agent(
         EnterpriseSearch(),
         sparkLLM(
             appid="d0667f0b",
@@ -42,6 +44,10 @@ if __name__ == "__main__":
         #  handle_parsing_errors=parse_errors,
         #handle_parsing_errors=True,
         return_intermediate_steps=True,
-    )
+    )'''
+
+    # TODO - New method to initialize the agent
+    agent = AgentExecutor()
+
 
     agent("请告诉我交通银行的涉诉信息")
