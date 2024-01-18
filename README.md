@@ -2,7 +2,7 @@
  AI Agent for retrieval information system  
  
 ChatAgent/  
-├── app/	  	
+├── app/	  
 │   ├── __init__.py  
 │   └── routes/  
 │       ├── __init__.py  
