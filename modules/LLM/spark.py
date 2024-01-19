@@ -1,4 +1,4 @@
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Iterator
 import _thread as thread
 import base64
 import datetime
@@ -16,6 +16,7 @@ import websocket  # 使用websocket_client
 
 from langchain.llms.base import LLM
 from langchain.callbacks.manager import CallbackManagerForLLMRun
+from langchain.schema.output import GenerationChunk
 
 from collections import deque
 from threading import Thread, Condition
@@ -90,27 +91,6 @@ class Ws_Param(object):
         # 此处打印出建立连接时候的url,参考本demo的时候可取消上方打印的注释，比对相同参数时生成的url与自己代码生成的url是否一致
         return url
 
-
-# 收到websocket错误的处理
-def on_error(ws, error):
-    ws.iterator.callback("出现了错误:" + error)
-
-# 收到websocket关闭的处理
-def on_close(ws,one,two):
-    pass
-
-# 收到websocket连接建立的处理
-def on_open(ws):
-    thread.start_new_thread(run, (ws,))
-
-def run(ws, *args):
-    data = json.dumps(gen_params(appid=ws.appid, domain= ws.domain,question=ws.question))
-    ws.send(data)
-
-# 收到websocket消息的处理
-def on_message(ws, message):
-    ws.iterator.callback(message)
-
 def gen_params(appid, domain,question):
     """
     通过appid和用户的提问来生成请参数
@@ -172,6 +152,7 @@ class sparkLLM(LLM):
     api_secret : str = None
     endpoint_url : str = None
     domain : str = None
+    content : str = None
     def __init__(self, appid, api_key, api_secret, spark_url, domain, **kwargs) -> None:
         super().__init__()
         self.appid = appid
@@ -196,58 +177,126 @@ class sparkLLM(LLM):
             **{"model_kwargs": _model_kwargs},
         }
 
-    
+    def _stream(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[GenerationChunk]:
+    # called by stream
+        input = checklen(getText("user", prompt))
+
+        # 收到websocket错误的处理
+        def on_error(ws, error):
+            ws.iterator.callback("出现了错误:" + error)
+
+        # 收到websocket关闭的处理
+        def on_close(ws,one,two):
+            pass
+
+        # 收到websocket连接建立的处理
+        def on_open(ws):
+            thread.start_new_thread(run, (ws,))
+
+        def run(ws, *args):
+            data = json.dumps(gen_params(appid=ws.appid, domain= ws.domain,question=ws.question))
+            ws.send(data)
+
+        # 收到websocket消息的处理
+        def on_message(ws, message):
+            ws.iterator.callback(message)
+
+        wsParam = Ws_Param(self.appid, self.api_key, self.api_secret, self.endpoint_url)
+        websocket.enableTrace(False)
+        wsUrl = wsParam.create_url()
+        ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
+        ws.appid = self.appid
+        ws.question = input
+        ws.domain = self.domain
+        # Initialize the CallbackToIterator 
+        ws.iterator = CallbackToIterator()
+        # Start the WebSocket connection in a separate thread
+        thread.start_new_thread(
+            ws.run_forever, (), {"sslopt": {"cert_reqs": ssl.CERT_NONE}}
+        )
+        # Iterate over the CallbackToIterator instance
+        total_tokens = 0
+        for message in ws.iterator:
+            data = json.loads(message)
+            code = data["header"]["code"]
+            if code != 0:
+                ws.close()
+                raise Exception(f"请求错误: {code}, {data}")
+            else:
+                choices = data["payload"]["choices"]
+                status = choices["status"]
+                content = choices["text"][0]["content"]
+                if "usage" in data["payload"]:
+                    total_tokens = data["payload"]["usage"]["text"]["total_tokens"]
+                if status == 2:
+                    ws.iterator.finish()  # Finish the iterator when the status is 2
+                    ws.close()
+
+                chunk = GenerationChunk(
+                        **{
+                        "text": content,
+                        "generation_info": {"tokens_usage":total_tokens}
+                    }
+                )
+                yield chunk 
+
     def _call(
         self,
-        input: str,
+        prompt: str,
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
+    # called by invoke
+        input = checklen(getText("user",prompt))
+        self.content = ""
+        # 收到websocket错误的处理
+        def on_error(ws, error):
+            print("### error:", error)
 
-        input = checklen(getText("user",input))
+        # 收到websocket关闭的处理
+        def on_close(ws,one,two):
+            print(" ")
 
-        def run():
-            wsParam = Ws_Param(self.appid, self.api_key, self.api_secret, self.endpoint_url)
-            websocket.enableTrace(False)
-            wsUrl = wsParam.create_url()
-            ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
-            ws.appid = self.appid
-            ws.question = input
-            ws.domain = self.domain
-            # Initialize the CallbackToIterator 
-            ws.iterator = CallbackToIterator()
-            # Start the WebSocket connection in a separate thread
-            thread.start_new_thread(
-                ws.run_forever, (), {"sslopt": {"cert_reqs": ssl.CERT_NONE}}
-            )
-            # Iterate over the CallbackToIterator instance
-            total_tokens = 0
-            for message in ws.iterator:
-                data = json.loads(message)
-                code = data["header"]["code"]
-                if code != 0:
+        # 收到websocket连接建立的处理
+        def on_open(ws):
+            thread.start_new_thread(run, (ws,))
+
+        def run(ws, *args):
+            data = json.dumps(gen_params(appid=ws.appid, domain= ws.domain,question=ws.question))
+            ws.send(data)
+
+        # 收到websocket消息的处理
+        def on_message(ws, message):
+            # print(message)
+            data = json.loads(message)
+            code = data['header']['code']
+            if code != 0:
+                print(f'请求错误: {code}, {data}')
+                ws.close()
+            else:
+                choices = data["payload"]["choices"]
+                status = choices["status"]
+                self.content += choices["text"][0]["content"]
+                if status == 2:
                     ws.close()
-                    raise Exception(f"请求错误: {code}, {data}")
-                else:
-                    choices = data["payload"]["choices"]
-                    status = choices["status"]
-                    content = choices["text"][0]["content"]
-                    if "usage" in data["payload"]:
-                        total_tokens = data["payload"]["usage"]["text"]["total_tokens"]
-                    if status == 2:
-                        ws.iterator.finish()  # Finish the iterator when the status is 2
-                        ws.close()
-                    yield content, total_tokens      
-        iter = run()
 
-        result = ""
-        for i in iter:
-            (content,token) = i
-            result += content
-            # yield result
+        wsParam = Ws_Param(self.appid, self.api_key, self.api_secret, self.endpoint_url)
+        websocket.enableTrace(False)
+        wsUrl = wsParam.create_url()
+        ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
+        ws.appid = self.appid
+        ws.question = input
+        ws.domain = self.domain
+        ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
 
-        return result
+        return self.content
     
 if __name__ == "__main__":
     llm = sparkLLM(appid="d0667f0b",
@@ -255,4 +304,9 @@ if __name__ == "__main__":
              api_secret="ODA0Y2IxMGU2ZTJhOTY4Njk0NWFlMWE2",
              spark_url="ws://spark-api.xf-yun.com/v3.1/chat",
              domain="generalv3")
-    print(llm._call(input="你好"))
+    # iter = llm.stream(input="你好")
+    # for i in iter:
+    #     print(i)
+    # print()
+
+    print(llm.invoke("你好"))
