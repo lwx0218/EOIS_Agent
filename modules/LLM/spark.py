@@ -14,9 +14,15 @@ from wsgiref.handlers import format_date_time
 
 import websocket  # 使用websocket_client
 
-from langchain.llms.base import LLM
+from langchain.llms.base import LLM, BaseLLM
 from langchain.callbacks.manager import CallbackManagerForLLMRun
 from langchain.schema.output import GenerationChunk
+# from langchain_core.language_models.llms import LLM
+from langchain_core.language_models.base import LanguageModelInput
+from langchain_core.runnables import RunnableConfig, ensure_config
+from langchain_core.callbacks import CallbackManager
+from langchain_core.load import dumpd
+from langchain_core.outputs import LLMResult
 
 from collections import deque
 from threading import Thread, Condition
@@ -222,6 +228,7 @@ class sparkLLM(LLM):
         )
         # Iterate over the CallbackToIterator instance
         total_tokens = 0
+        chunk_list = []
         for message in ws.iterator:
             data = json.loads(message)
             code = data["header"]["code"]
@@ -244,7 +251,95 @@ class sparkLLM(LLM):
                         "generation_info": {"tokens_usage":total_tokens}
                     }
                 )
-                yield chunk 
+
+                # 滑动窗口检查stop
+                if len(chunk_list) < 2:
+                    chunk_list.append(chunk)
+                else:
+                    combined_text = ''.join([chunk.text for chunk in chunk_list])
+                    if stop[0] in combined_text:
+                        index =combined_text.index(stop[0])
+                        if index + 1 <= len(chunk_list[0].text):
+                        # stop开始出现在第一个chunk
+                            chunk_list[0].text = chunk_list[0].text[:index] # 截取stop之前内容
+                        chunk_list.pop(1)
+                        break
+                    yield chunk_list[0]
+                    chunk_list.pop(0)
+                    chunk_list.append(chunk)
+        # 返回剩余chunk
+        yield from chunk_list
+
+        
+                        
+                
+
+    # def stream(
+    #     self,
+    #     input: LanguageModelInput,
+    #     config: Optional[RunnableConfig] = None,
+    #     *,
+    #     stop: Optional[List[str]] = None,
+    #     **kwargs: Any,
+    # ) -> Iterator[str]:
+    #     # 重写该方法以适应不支持stop的LLM，主动截取
+    #     if type(self)._stream == BaseLLM._stream:
+    #         # model doesn't implement streaming, so use default implementation
+    #         yield self.invoke(input, config=config, stop=stop, **kwargs)
+    #     else:
+    #         prompt = self._convert_input(input).to_string()
+    #         config = ensure_config(config)
+    #         params = self.dict()
+    #         params["stop"] = stop
+    #         params = {**params, **kwargs}
+    #         options = {"stop": stop}
+    #         callback_manager = CallbackManager.configure(
+    #             config.get("callbacks"),
+    #             self.callbacks,
+    #             self.verbose,
+    #             config.get("tags"),
+    #             self.tags,
+    #             config.get("metadata"),
+    #             self.metadata,
+    #         )
+    #         (run_manager,) = callback_manager.on_llm_start(
+    #             dumpd(self),
+    #             [prompt],
+    #             invocation_params=params,
+    #             options=options,
+    #             name=config.get("run_name"),
+    #             batch_size=1,
+    #         )
+    #         generation: Optional[GenerationChunk] = None
+    #         try:
+    #             for chunk in self._stream(
+    #                 prompt, stop=stop, run_manager=run_manager, **kwargs
+    #             ):
+    #                 yield chunk.text
+    #                 if generation is None:
+    #                     generation = chunk
+    #                 else:
+    #                     generation += chunk
+    #                 # 添加了stop的检查
+    #                 stop_tag = False
+    #                 for s in stop:
+    #                     if s in generation.text:
+    #                         index =generation.text.index(s)
+    #                         generation.text = generation.text[:index]
+    #                         stop_tag = True
+    #                         break
+    #                 if stop_tag: break
+    #             assert generation is not None
+    #         except BaseException as e:
+    #             run_manager.on_llm_error(
+    #                 e,
+    #                 response=LLMResult(
+    #                     generations=[[generation]] if generation else []
+    #                 ),
+    #             )
+    #             raise e
+    #         else:
+    #             run_manager.on_llm_end(LLMResult(generations=[[generation]]))
 
     def _call(
         self,
@@ -308,5 +403,15 @@ if __name__ == "__main__":
     # for i in iter:
     #     print(i)
     # print()
+    from langchain.globals import set_llm_cache
+    import time
+    from langchain.cache import InMemoryCache
 
-    print(llm.invoke("你好"))
+    set_llm_cache(InMemoryCache())
+    a = time.time()
+    print(llm.predict("你好，你是？"))
+    b = time.time() - a
+    print(b)
+    print(llm.predict("你好？"))
+    
+    print(time.time() - a - b)

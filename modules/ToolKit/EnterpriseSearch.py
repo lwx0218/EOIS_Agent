@@ -42,3 +42,8 @@ class EnterpriseSearch(BaseTool):
         }
         
         return response["result"]
+    
+
+if __name__ == "__main__":
+    tool = EnterpriseSearch()
+    print(tool._run(1))
