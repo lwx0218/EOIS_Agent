@@ -1,4 +1,4 @@
-from typing import Any, List, Mapping, Optional, Iterator
+from typing import Any, List, Mapping, Optional, Iterator, AsyncIterator
 import _thread as thread
 import base64
 import datetime
@@ -11,7 +11,7 @@ from datetime import datetime
 from time import mktime
 from urllib.parse import urlencode
 from wsgiref.handlers import format_date_time
-
+import asyncio
 import websocket  # 使用websocket_client
 
 from langchain.llms.base import LLM, BaseLLM
@@ -20,9 +20,10 @@ from langchain.schema.output import GenerationChunk
 # from langchain_core.language_models.llms import LLM
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.runnables import RunnableConfig, ensure_config
-from langchain_core.callbacks import CallbackManager
+from langchain_core.callbacks import CallbackManager, AsyncCallbackManagerForLLMRun, AsyncCallbackManager
 from langchain_core.load import dumpd
 from langchain_core.outputs import LLMResult
+from langchain_core.runnables.config import run_in_executor
 
 from collections import deque
 from threading import Thread, Condition
@@ -54,6 +55,40 @@ class CallbackToIterator:
         with self.cond:
             self.finished = True
             self.cond.notify()  # Wake up the generator if it's waiting.
+
+class AsyncCallbackToAsyncIterator:
+    def __init__(self):
+        self.queue = deque()
+        self.cond = asyncio.Condition()
+        self.finished = False
+
+    def callback(self, result):
+        async def wake_up_generator():
+            async with self.cond:
+                self.queue.append(result)
+                self.cond.notify()  # Wake up the generator.
+
+        asyncio.create_task(wake_up_generator())
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        async with self.cond:
+            # Wait for a value to be added to the queue.
+            while not self.queue and not self.finished:
+                await self.cond.wait()
+            if not self.queue:
+                raise StopAsyncIteration()
+            return self.queue.popleft()
+
+    def finish(self):
+        async def wake_up_generator():
+            async with self.cond:
+                self.finished = True
+                self.cond.notify()  # Wake up the generator if it's waiting.
+
+        asyncio.create_task(wake_up_generator())
 
 class Ws_Param(object):
     # 初始化
@@ -160,7 +195,7 @@ class sparkLLM(LLM):
     domain : str = None
     content : str = None
     def __init__(self, appid, api_key, api_secret, spark_url, domain, **kwargs) -> None:
-        super().__init__()
+        super().__init__(**kwargs)
         self.appid = appid
         self.api_key = api_key
         self.api_secret = api_secret
@@ -182,6 +217,7 @@ class sparkLLM(LLM):
             **{"endpoint_url": self.endpoint_url},
             **{"model_kwargs": _model_kwargs},
         }
+        
 
     def _stream(
         self,
@@ -270,76 +306,96 @@ class sparkLLM(LLM):
         # 返回剩余chunk
         yield from chunk_list
 
-        
-                        
-                
+    async def _astream(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[GenerationChunk]:
+        # called by astream
+        print(7654321)
+        input = checklen(getText("user", prompt))
 
-    # def stream(
-    #     self,
-    #     input: LanguageModelInput,
-    #     config: Optional[RunnableConfig] = None,
-    #     *,
-    #     stop: Optional[List[str]] = None,
-    #     **kwargs: Any,
-    # ) -> Iterator[str]:
-    #     # 重写该方法以适应不支持stop的LLM，主动截取
-    #     if type(self)._stream == BaseLLM._stream:
-    #         # model doesn't implement streaming, so use default implementation
-    #         yield self.invoke(input, config=config, stop=stop, **kwargs)
-    #     else:
-    #         prompt = self._convert_input(input).to_string()
-    #         config = ensure_config(config)
-    #         params = self.dict()
-    #         params["stop"] = stop
-    #         params = {**params, **kwargs}
-    #         options = {"stop": stop}
-    #         callback_manager = CallbackManager.configure(
-    #             config.get("callbacks"),
-    #             self.callbacks,
-    #             self.verbose,
-    #             config.get("tags"),
-    #             self.tags,
-    #             config.get("metadata"),
-    #             self.metadata,
-    #         )
-    #         (run_manager,) = callback_manager.on_llm_start(
-    #             dumpd(self),
-    #             [prompt],
-    #             invocation_params=params,
-    #             options=options,
-    #             name=config.get("run_name"),
-    #             batch_size=1,
-    #         )
-    #         generation: Optional[GenerationChunk] = None
-    #         try:
-    #             for chunk in self._stream(
-    #                 prompt, stop=stop, run_manager=run_manager, **kwargs
-    #             ):
-    #                 yield chunk.text
-    #                 if generation is None:
-    #                     generation = chunk
-    #                 else:
-    #                     generation += chunk
-    #                 # 添加了stop的检查
-    #                 stop_tag = False
-    #                 for s in stop:
-    #                     if s in generation.text:
-    #                         index =generation.text.index(s)
-    #                         generation.text = generation.text[:index]
-    #                         stop_tag = True
-    #                         break
-    #                 if stop_tag: break
-    #             assert generation is not None
-    #         except BaseException as e:
-    #             run_manager.on_llm_error(
-    #                 e,
-    #                 response=LLMResult(
-    #                     generations=[[generation]] if generation else []
-    #                 ),
-    #             )
-    #             raise e
-    #         else:
-    #             run_manager.on_llm_end(LLMResult(generations=[[generation]]))
+        # 收到websocket错误的处理
+        def on_error(ws, error):
+            asyncio.create_task(ws.iterator.callback("出现了错误:" + error))
+
+        # 收到websocket关闭的处理
+        def on_close(ws, one, two):
+            pass
+
+        # 收到websocket连接建立的处理
+        def on_open(ws):
+            asyncio.create_task(run(ws))
+
+        async def run(ws, *args):
+            data = json.dumps(gen_params(appid=ws.appid, domain=ws.domain, question=ws.question))
+            ws.send(data)
+
+        # 收到websocket消息的处理
+        def on_message(ws, message):
+            asyncio.create_task(ws.iterator.callback(message))
+
+        wsParam = Ws_Param(self.appid, self.api_key, self.api_secret, self.endpoint_url)
+        websocket.enableTrace(False)
+        wsUrl = wsParam.create_url()
+        ws = websocket.WebSocketApp(
+            wsUrl, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open
+        )
+        ws.appid = self.appid
+        ws.question = input
+        ws.domain = self.domain
+        # Initialize the AsyncCallbackToAsyncIterator
+        ws.iterator = AsyncCallbackToAsyncIterator()
+        # Start the WebSocket connection in a separate thread
+        asyncio.create_task(
+            ws.run_forever()
+        )
+        # Iterate over the AsyncCallbackToAsyncIterator instance
+        total_tokens = 0
+        chunk_list = []
+        async for message in ws.iterator:
+            data = json.loads(message)
+            code = data["header"]["code"]
+            if code != 0:
+                ws.close()
+                raise Exception(f"请求错误: {code}, {data}")
+            else:
+                choices = data["payload"]["choices"]
+                status = choices["status"]
+                content = choices["text"][0]["content"]
+                if "usage" in data["payload"]:
+                    total_tokens = data["payload"]["usage"]["text"]["total_tokens"]
+                if status == 2:
+                    ws.iterator.finish()  # Finish the iterator when the status is 2
+                    ws.close()
+
+                chunk = GenerationChunk(
+                    **{
+                        "text": content,
+                        "generation_info": {"tokens_usage": total_tokens},
+                    }
+                )
+
+                # 滑动窗口检查stop
+                if len(chunk_list) < 2:
+                    chunk_list.append(chunk)
+                else:
+                    combined_text = "".join([chunk.text for chunk in chunk_list])
+                    if stop[0] in combined_text:
+                        index = combined_text.index(stop[0])
+                        if index + 1 <= len(chunk_list[0].text):
+                            # stop开始出现在第一个chunk
+                            chunk_list[0].text = chunk_list[0].text[:index]  # 截取stop之前内容
+                        chunk_list.pop(1)
+                        break
+                    yield chunk_list[0]
+                    chunk_list.pop(0)
+                    chunk_list.append(chunk)
+        # 返回剩余chunk
+        for chunk in chunk_list:
+            yield chunk
 
     def _call(
         self,
@@ -390,6 +446,11 @@ class sparkLLM(LLM):
         ws.question = input
         ws.domain = self.domain
         ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+
+        for item in ["Observation:","Observation："]:
+            if item in self.content:
+                index =self.content.index(item)
+                self.content = self.content[:index]
 
         return self.content
     

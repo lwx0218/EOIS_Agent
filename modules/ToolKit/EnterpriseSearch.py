@@ -41,7 +41,7 @@ class EnterpriseSearch(BaseTool):
             }
         }
         
-        return response["result"]
+        return str(response["result"])
     
 
 if __name__ == "__main__":
